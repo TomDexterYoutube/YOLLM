@@ -1,394 +1,738 @@
+# =========================================================
+# Environment vars MUST be set before importing torch
+# =========================================================
 import os
+os.environ["OMP_SCHEDULE"]        = "static"
+os.environ["OMP_PROC_BIND"]       = "close"
+os.environ["GOMP_SPINCOUNT"]      = "100000000"
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+os.environ["KMP_AFFINITY"]        = "granularity=fine,compact,1,0"
+os.environ["KMP_BLOCKTIME"]       = "1"
+
+import csv
 import time
 import torch
 import gc
-import psutil
 import signal
 import sys
-from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
+import logging
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 from model import GPTConfig, GPT
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, train_tokenizer, hash_data_dir
+from generate import generate_response
 from config import *
-import threading
-from lion_pytorch import Lion
 
-# Overwrite the file to clear it at the start of training
-with open("epoch_generations.txt", "w") as f:
-    f.write("")
-    pass
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
-latest_cpu_temp = [None]
-can_train = threading.Event()
-can_train.set()  # Allow training by default
+# =========================================================
+# Logging Setup
+# =========================================================
 
-# New: Lock to pause/resume training instantly
-train_lock = threading.Lock()
-train_lock.acquire()  # Start locked, will be released if temp is OK
+os.makedirs("data/models", exist_ok=True)
 
-def cpu_temp_monitor(poll_interval=1):
-    while True:
-        temp = None
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                temp = int(f.read()) / 1000.0
-        except Exception:
-            pass
-        latest_cpu_temp[0] = temp
+log = logging.getLogger("train")
+log.setLevel(logging.DEBUG)
 
-        # Control training permission
-        if temp is not None and temp >= 87:
-            if can_train.is_set():
-                print(f"CPU temperature is {temp:.1f}°C. Pausing training for safety.")
-            can_train.clear()
-            if train_lock.locked() is False:
-                train_lock.acquire()
-        elif temp is not None and temp <= 60:
-            if not can_train.is_set():
-                print(f"CPU temperature is {temp:.1f}°C. Resuming training.")
-            can_train.set()
-            if train_lock.locked():
-                try:
-                    train_lock.release()
-                except RuntimeError:
-                    pass
+fh = logging.FileHandler("training.log", mode="a", encoding="utf-8")
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+))
 
-        time.sleep(poll_interval)
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter("%(message)s"))
 
-# Start the background temperature monitor thread
-temp_thread = threading.Thread(target=cpu_temp_monitor, args=(5,), daemon=True)
-temp_thread.start()
+log.addHandler(fh)
+log.addHandler(ch)
 
-def get_cpu_temp():
-    return latest_cpu_temp[0]
+def info(msg):   log.info(msg)
+def detail(msg): log.debug(msg)
+def warn(msg):   log.warning(msg)
+def error(msg):  log.error(msg)
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.manual_seed(1337)
+PROGRESS_LOG  = "progress.log"
+LOSS_RESP_LOG = "loss-resp.log"
 
-# Load tokenizer
-tokenizer = get_tokenizer()
+EVAL_PROMPTS = [
+    "user: hi~",
+    "user: how are you?~",
+    "user: what is your name?~",
+]
+
+info("=" * 60)
+info("Training started")
+info("=" * 60)
+
+# =========================================================
+# Tokenizer
+# =========================================================
+
+# CharTokenizer builds its vocab from training data automatically.
+# train_tokenizer() is a no-op if tokenizer_vocab.json already exists.
+if not os.path.exists("tokenizer_vocab.json"):
+    info("Tokenizer vocab not found — building from training data...")
+    train_tokenizer()
+
+tokenizer  = get_tokenizer()
 vocab_size = tokenizer.get_vocab_size()
+detail(f"Tokenizer loaded | vocab size: {vocab_size} characters")
 
-# Dataset class
-class TextDataset(Dataset):
-    def __init__(self, folder_path, block_size):
-        data = ""
-        # Recursively walk through all subfolders and files
-        for root, _, files in os.walk(folder_path):
-            for file_name in files:
-                if file_name.endswith(".txt"):
-                    file_path = os.path.join(root, file_name)
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        data += f.read() + "\n"
-        # CharTokenizer.encode returns a list, not an object with .ids
-        self.tokens = tokenizer.encode(data)
+# =========================================================
+# Device Setup
+# =========================================================
+
+device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IS_CUDA = device.type == "cuda"
+IS_CPU  = device.type == "cpu"
+
+# Seed for reproducibility — set before any model init or data shuffling
+torch.manual_seed(1337)
+if IS_CUDA:
+    torch.cuda.manual_seed_all(1337)
+
+n_threads = 0
+
+if IS_CPU:
+    if HAS_PSUTIL:
+        physical_cores = list(range(psutil.cpu_count(logical=False)))
+        psutil.Process().cpu_affinity(physical_cores)
+        n_threads = len(physical_cores)
+        detail(f"CPU: pinned to {n_threads} physical cores")
+    else:
+        n_threads = os.cpu_count() or 1
+        detail(f"CPU: using {n_threads} logical threads")
+    torch.set_num_threads(n_threads)
+    torch.set_num_interop_threads(n_threads)
+    os.environ["OMP_NUM_THREADS"] = str(n_threads)
+    os.environ["MKL_NUM_THREADS"] = str(n_threads)
+else:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32        = True
+    torch.backends.cudnn.benchmark         = True
+    detail(f"GPU: {torch.cuda.get_device_name(0)}")
+
+torch.set_float32_matmul_precision("high")
+
+# =========================================================
+# Mixed Precision
+# =========================================================
+
+if IS_CUDA:
+    AMP_DTYPE  = torch.float16
+    AMP_DEVICE = "cuda"
+    USE_SCALER = True
+    scaler     = torch.cuda.amp.GradScaler()
+    detail("Mixed precision: float16 (CUDA)")
+else:
+    def _benchmark_dtype(dtype, steps=5):
+        try:
+            a = torch.randn(256, 256).to(dtype)
+            b = torch.randn(256, 256).to(dtype)
+            for _ in range(2): torch.matmul(a, b)
+            t0 = time.perf_counter()
+            for _ in range(steps): torch.matmul(a, b)
+            return (time.perf_counter() - t0) / steps
+        except Exception:
+            return float("inf")
+
+    t_f32  = _benchmark_dtype(torch.float32)
+    t_bf16 = _benchmark_dtype(torch.bfloat16)
+    detail(f"dtype benchmark — float32: {t_f32*1000:.3f}ms | bfloat16: {t_bf16*1000:.3f}ms")
+    AMP_DTYPE  = torch.bfloat16 if t_bf16 < t_f32 else torch.float32
+    AMP_DEVICE = "cpu"
+    USE_SCALER = False
+    scaler     = None
+    detail(f"Mixed precision: {AMP_DTYPE} (CPU)")
+
+def autocast():
+    if AMP_DTYPE == torch.float32:
+        return torch.autocast(AMP_DEVICE, enabled=False)
+    return torch.autocast(AMP_DEVICE, dtype=AMP_DTYPE)
+
+# =========================================================
+# Pre-Batched Dataset  (with validation split)
+#
+# Chunks are non-overlapping slices of the tokenised corpus.
+# They are shuffled BEFORE the train/val split so the val set
+# is a random sample, not just the tail of the corpus.
+# The full dataset tensor is cached to disk keyed by a hash
+# of the source files so it is rebuilt automatically when the
+# training data changes.
+# =========================================================
+
+VAL_SPLIT  = getattr(sys.modules["config"], "VAL_SPLIT", 0.05)
+LOG_EVERY  = getattr(sys.modules["config"], "LOG_EVERY",  10)
+
+# Read gradient accumulation steps from config, default to 1
+GRAD_ACCUM_STEPS = getattr(sys.modules["config"], "GRAD_ACCUM_STEPS", 1)
+
+
+class PreBatchedDataset:
+    def __init__(self, folder_path, block_size, batch_size):
         self.block_size = block_size
+        self.batch_size = batch_size
+
+        data_hash  = hash_data_dir(folder_path)
+        cache_name = f"_prebatched_bs{block_size}_{data_hash}.pt"
+        cache_path = os.path.join(folder_path, cache_name)
+
+        if os.path.exists(cache_path):
+            detail("Loading pre-batched cache from disk...")
+            saved    = torch.load(cache_path, map_location="cpu", weights_only=True)
+            x, y     = saved["x"], saved["y"]
+            n_chunks = saved["n_chunks"]
+        else:
+            detail("Building pre-batched dataset (caching for future runs)...")
+            data = ""
+            for root, _, files in os.walk(folder_path):
+                for fname in sorted(files):
+                    if fname.endswith(".txt") and not fname.startswith("_"):
+                        with open(os.path.join(root, fname), "r", encoding="utf-8") as f:
+                            data += f.read() + "\n"
+
+            if not data.strip():
+                raise ValueError(f"No text found in {folder_path}")
+
+            tokens   = tokenizer.encode(data)
+            tokens   = torch.tensor(tokens, dtype=torch.long)
+            n_chunks = (len(tokens) - 1) // block_size
+
+            if n_chunks == 0:
+                raise ValueError(
+                    "Dataset too small for block_size — add more text or reduce BLOCK_SIZE."
+                )
+
+            t = tokens[: n_chunks * block_size + 1]
+            x = torch.stack([t[i*block_size     : i*block_size + block_size    ] for i in range(n_chunks)])
+            y = torch.stack([t[i*block_size + 1 : i*block_size + block_size + 1] for i in range(n_chunks)])
+
+            # Shuffle BEFORE splitting so val set is a random sample
+            perm = torch.randperm(n_chunks)
+            x, y = x[perm], y[perm]
+
+            torch.save({"x": x, "y": y, "n_chunks": n_chunks}, cache_path)
+            detail(f"Cached {n_chunks:,} non-overlapping chunks to {cache_path}")
+
+        # Carve out held-out validation split
+        n_val   = max(1, int(n_chunks * VAL_SPLIT))
+        n_train = n_chunks - n_val
+
+        self.x_train = x[:n_train]
+        self.y_train = y[:n_train]
+        self.x_val   = x[n_train:]
+        self.y_val   = y[n_train:]
+
+        self.n_train       = n_train
+        self.n_val         = n_val
+        self.n_batches     = n_train // batch_size
+        self.n_val_batches = max(1, n_val // batch_size)
+
+        detail(
+            f"Dataset: {n_train:,} train chunks | {n_val:,} val chunks | "
+            f"{self.n_batches:,} train batches/epoch | {self.n_val_batches:,} val batches"
+        )
 
     def __len__(self):
-        return max(0, len(self.tokens) - self.block_size)
+        return self.n_batches
 
-    def __getitem__(self, idx):
-        chunk = self.tokens[idx:idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-        return x, y
+    def __iter__(self):
+        """Iterate over the training split, shuffling each epoch if configured."""
+        if SHUFFLE_DATA_EACH_EPOCH:
+            perm    = torch.randperm(self.n_train)
+            x_epoch = self.x_train[perm]
+            y_epoch = self.y_train[perm]
+        else:
+            x_epoch = self.x_train
+            y_epoch = self.y_train
 
-# Setup data
-dataset = TextDataset("data/training_data/", BLOCK_SIZE)
-dataset_size = len(dataset)
+        for i in range(self.n_batches):
+            s = i * self.batch_size
+            e = s + self.batch_size
+            yield x_epoch[s:e].to(device), y_epoch[s:e].to(device)
 
-if dataset_size == 0:
-    print("ERROR: Dataset is empty.")
-    exit()
+    def val_iter(self):
+        """Iterate over the validation split (no shuffle)."""
+        for i in range(self.n_val_batches):
+            s = i * self.batch_size
+            e = s + self.batch_size
+            yield self.x_val[s:e].to(device), self.y_val[s:e].to(device)
 
-# Define variables before using them
-block_size = BLOCK_SIZE  # From config.py
-batch_size = BATCH_SIZE  # From config.py
 
-# Setup data with weighted sampling
-def get_sample_weights(dataset):
-    # Weight rare tokens more heavily
-    token_counts = torch.bincount(torch.tensor(dataset.tokens))
-    token_weights = 1.0 / (token_counts + 1)  # Add 1 to avoid division by zero
-    sample_weights = torch.zeros(len(dataset))
-    for i in range(len(dataset)):
-        chunk = dataset.tokens[i:i + dataset.block_size]
-        sample_weights[i] = token_weights[chunk].mean()
-    return sample_weights
+# =========================================================
+# Validation loss
+# =========================================================
 
-# Create dataset before using it
-dataset = TextDataset("data/training_data/", block_size)
-
-# Create weighted sampler
-sample_weights = get_sample_weights(dataset)
-sampler = torch.utils.data.WeightedRandomSampler(
-    weights=sample_weights,
-    num_samples=len(dataset),
-    replacement=True
-)
-
-dataloader = DataLoader(
-    dataset, 
-    batch_size=batch_size,
-    sampler=sampler if SHUFFLE_DATA_EACH_EPOCH else None,
-    num_workers=2,
-    pin_memory=True if device == 'cuda' else False
-)
-
-# Build model
-model = GPT(GPTConfig(vocab_size=vocab_size, block_size=block_size)).to(device)
-
-optimizer = Lion(
-    model.parameters(),
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-    betas=(0.7, 0.8),
-)
-
-# Optional resume from checkpoint
-checkpoint_path = "data/models/model.pt"
-epoch_path = "data/models/last_epoch.txt"
-resume = False
-start_epoch = 0
-if os.path.exists(checkpoint_path):
-    ans = input(f"Checkpoint found at {checkpoint_path}. Resume training from checkpoint? (y/n): ").strip().lower()
-    if ans == "y":
-        resume = True
-
-if resume:
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    print(f"Resumed model weights from {checkpoint_path}")
-    if os.path.exists(epoch_path):
-        try:
-            with open(epoch_path, "r") as f:
-                start_epoch = int(f.read().strip())
-            print(f"Resuming from epoch {start_epoch + 1}")
-        except Exception:
-            start_epoch = 0
-    else:
-        start_epoch = 0
-
-# ACT Tracking for all epochs
-total_batches = EPOCHS * len(dataloader)
-start_time = time.time()
-batches_done = 0
-
-def generate_text(model, prompt, tokenizer, device, max_new_tokens=MAX_TRAIN_TOKENS):
-    config = ModelConfig()  # Get generation parameters
+@torch.no_grad()
+def evaluate_val_loss(model, dataloader):
+    """Mean cross-entropy loss over the full validation split."""
     model.eval()
-    input_ids = tokenizer.encode(prompt)
-    if hasattr(input_ids, "ids"):
-        input_ids = input_ids.ids
-    input_ids = torch.tensor([input_ids], dtype=torch.long).to(device)
-    for _ in range(max_new_tokens):
+    total, count = 0.0, 0
+    for x, y in dataloader.val_iter():
+        with autocast():
+            _, loss = model(x, y)
+        total += loss.item()
+        count += 1
+    model.train()
+    return total / count if count > 0 else float("nan")
+
+
+# =========================================================
+# Progress / CSV logs
+# =========================================================
+
+def write_loss_resp(epoch, avg_loss, val_loss, lr, tok_per_sec, model):
+    """Append one CSV row per epoch to loss-resp.log."""
+    model.eval()
+    responses = []
+    with torch.no_grad():
+        for prompt in EVAL_PROMPTS:
+            try:
+                r = generate_response(
+                    prompt, model, tokenizer, device, autocast,
+                    max_new_tokens=MAX_GEN_TOKENS, stream=False,
+                )
+                responses.append(r.strip().replace("\n", " "))
+            except Exception as e:
+                responses.append(f"[error: {e}]")
+    # Leave model in eval — caller is responsible for setting train mode
+    write_header = (
+        not os.path.exists(LOSS_RESP_LOG)
+        or os.path.getsize(LOSS_RESP_LOG) == 0
+    )
+
+    with open(LOSS_RESP_LOG, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            header = (
+                ["epoch", "train_loss", "val_loss", "lr", "tok_per_sec"]
+                + [f"response_{i+1}" for i in range(len(EVAL_PROMPTS))]
+            )
+            writer.writerow(header)
+        writer.writerow(
+            [epoch, f"{avg_loss:.4f}", f"{val_loss:.4f}", f"{lr:.2e}", tok_per_sec]
+            + responses
+        )
+
+
+def write_progress(epoch, avg_loss, val_loss, lr, tok_per_sec, model):
+    """Append a human-readable epoch summary to progress.log."""
+    model.eval()
+    with open(PROGRESS_LOG, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(
+            f"Epoch {epoch:>3} | train {avg_loss:.4f} | val {val_loss:.4f} | "
+            f"lr {lr:.2e} | {tok_per_sec:,} tok/s\n"
+        )
+        f.write(f"{'='*60}\n")
         with torch.no_grad():
-            logits, _ = model(input_ids)
-            next_token_logits = logits[:, -1, :] / config.temperature
-            
-            # Apply repetition penalty
-            if config.repetition_penalty != 1.0:
-                for i in range(input_ids.shape[1]):
-                    next_token_logits[0, input_ids[0, i]] /= config.repetition_penalty
-            
-            # Apply top-p (nucleus) sampling
-            if config.top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > config.top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_token_logits[indices_to_remove] = float('-inf')
-            
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            
-            # Check minimum length
-            if input_ids.shape[1] < config.min_length:
-                continue
-                
-            # Apply no-repeat-ngram
-            if config.no_repeat_ngram_size > 0 and input_ids.shape[1] >= config.no_repeat_ngram_size:
-                ngram = input_ids[0, -config.no_repeat_ngram_size:].tolist()
-                if ngram in input_ids[0, :-config.no_repeat_ngram_size].tolist():
-                    break
+            for prompt in EVAL_PROMPTS:
+                try:
+                    response = generate_response(
+                        prompt, model, tokenizer, device, autocast,
+                        max_new_tokens=MAX_GEN_TOKENS, stream=False,
+                    )
+                    f.write(f"  > {prompt}\n")
+                    f.write(f"    {response.strip()}\n\n")
+                except Exception as e:
+                    f.write(f"  > {prompt}\n")
+                    f.write(f"    [generation failed: {e}]\n\n")
+    # Leave model in eval — caller is responsible for setting train mode
+
+
+# =========================================================
+# DataLoader + Model
+# =========================================================
+
+def unwrap_model(m):
+    """Strip torch.compile wrapper if present."""
+    return getattr(m, "_orig_mod", m)
+
+dataloader = PreBatchedDataset("data/training_data/", BLOCK_SIZE, BATCH_SIZE)
+if len(dataloader) == 0:
+    error("Dataset produced 0 batches — add more text or reduce BLOCK_SIZE/BATCH_SIZE.")
+    sys.exit(1)
+
+model = GPT(GPTConfig(vocab_size=vocab_size, block_size=BLOCK_SIZE)).to(device)
+
+param_count = sum(p.numel() for p in model.parameters())
+detail(f"Model parameters: {param_count:,}")
+
+if IS_CUDA and hasattr(torch, "compile"):
+    model = torch.compile(model, mode="reduce-overhead")
+    detail("torch.compile: reduce-overhead [GPU]")
+else:
+    detail("torch.compile: disabled [CPU]")
+
+# =========================================================
+# Optimizer
+# =========================================================
+
+# Support both single LR (original config) and LR_MAX/LR_MIN (advanced config)
+try:
+    from config import LEARNING_RATE_MAX, LEARNING_RATE_MIN
+    LR_MAX = LEARNING_RATE_MAX
+    LR_MIN = LEARNING_RATE_MIN
+except ImportError:
+    LR_MAX = LEARNING_RATE
+    LR_MIN = LEARNING_RATE * 0.01
+
+BETA_ONE = getattr(sys.modules["config"], "BETA_ONE", 0.9)
+BETA_TWO = getattr(sys.modules["config"], "BETA_TWO", 0.95)
+
+if IS_CPU:
+    # Lion can behave poorly on CPU without proper bfloat16 support;
+    # AdamW with foreach=True is faster and more stable on CPU.
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR_MAX,
+        weight_decay=WEIGHT_DECAY,
+        betas=(BETA_ONE, BETA_TWO),
+        foreach=True,
+    )
+    detail("Optimizer: AdamW foreach=True [CPU]")
+else:
     try:
-        return tokenizer.decode(input_ids[0].tolist())
-    except Exception as e:
-        return f"[DECODE ERROR: {e}]"
+        from lion_pytorch import Lion
+        optimizer = Lion(
+            model.parameters(),
+            lr=LR_MAX,
+            weight_decay=WEIGHT_DECAY,
+            betas=(BETA_ONE, BETA_TWO),
+        )
+        detail("Optimizer: Lion [GPU]")
+    except ImportError:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=LR_MAX,
+            weight_decay=WEIGHT_DECAY,
+            betas=(BETA_ONE, BETA_TWO),
+            foreach=True,
+        )
+        detail("Optimizer: AdamW foreach=True (lion_pytorch not found) [GPU]")
+
+# =========================================================
+# LR Scheduler
+#
+# total_steps is based on gradient-update steps
+# (batches / GRAD_ACCUM_STEPS), not raw batch count.
+# This matters when GRAD_ACCUM_STEPS > 1 — previously the
+# scheduler decayed too slowly, keeping LR too high.
+# =========================================================
+
+total_steps  = (EPOCHS * len(dataloader)) // GRAD_ACCUM_STEPS
+warmup_steps = int(getattr(sys.modules["config"], "SCHEDULER_WARMUP", 0.1) * total_steps)
+sched_type   = getattr(sys.modules["config"], "SCHEDULER_TYPE", "cosine")
+
+if warmup_steps > 0 and sched_type == "cosine":
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[
+            LinearLR(optimizer, start_factor=LR_MIN / LR_MAX, end_factor=1.0,
+                     total_iters=warmup_steps),
+            CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps),
+                              eta_min=LR_MIN),
+        ],
+        milestones=[warmup_steps],
+    )
+    detail(f"Scheduler: warmup {warmup_steps} steps then cosine {LR_MAX:.2e} -> {LR_MIN:.2e}")
+elif sched_type == "cosine":
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=LR_MIN)
+    detail(f"Scheduler: cosine {LR_MAX:.2e} -> {LR_MIN:.2e} over {total_steps} steps")
+elif sched_type == "linear":
+    scheduler = LinearLR(optimizer, start_factor=1.0,
+                         end_factor=LR_MIN / LR_MAX, total_iters=total_steps)
+    detail(f"Scheduler: linear {LR_MAX:.2e} -> {LR_MIN:.2e} over {total_steps} steps")
+else:
+    # Flat — constant LR
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=LR_MAX)
+    detail(f"Scheduler: flat {LR_MAX:.2e}")
+
+# =========================================================
+# Checkpoints
+# =========================================================
+
+checkpoint_path  = "data/models/model.pt"
+epoch_path       = "data/models/last_epoch.txt"
+scheduler_path   = "data/models/scheduler.pt"
+progress_path    = "data/models/progress.pt"   # FIX: saves batches_done for accurate resume
+start_epoch      = 0
+resumed_batches  = 0  # FIX: track actual completed batches across resumed runs
+
+if os.path.exists(checkpoint_path):
+    ans = input("Checkpoint found. Resume? (y/n): ").strip().lower()
+    if ans == "y":
+        unwrap_model(model).load_state_dict(
+            torch.load(checkpoint_path, map_location=device, weights_only=True)
+        )
+        detail("Resumed model weights.")
+        if os.path.exists(epoch_path):
+            with open(epoch_path) as f:
+                start_epoch = int(f.read().strip())
+        if os.path.exists(scheduler_path):
+            scheduler.load_state_dict(
+                torch.load(scheduler_path, map_location="cpu", weights_only=True)
+            )
+            detail(
+                f"Resumed scheduler | last_epoch={scheduler.last_epoch} | "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
+            )
+        # FIX: restore batches_done so ETA/tok-per-sec are meaningful after resume
+        if os.path.exists(progress_path):
+            prog = torch.load(progress_path, map_location="cpu", weights_only=True)
+            resumed_batches = prog.get("batches_done", 0)
+            detail(f"Resumed progress: {resumed_batches:,} batches previously done")
+        info(f"Resuming from epoch {start_epoch + 1}")
+
+# =========================================================
+# Startup summary
+# =========================================================
+
+dtype_name = {
+    torch.float32:  "float32",
+    torch.float16:  "float16",
+    torch.bfloat16: "bfloat16",
+}[AMP_DTYPE]
+device_str = (
+    f"GPU ({torch.cuda.get_device_name(0)})" if IS_CUDA
+    else f"CPU ({n_threads} cores)"
+)
+
+info(f"  Device   : {device_str}")
+info(f"  Dtype    : {dtype_name}")
+info(f"  Params   : {param_count:,}")
+info(f"  Chunks   : {dataloader.n_train:,} train | {dataloader.n_val:,} val")
+info(f"  Batches  : {len(dataloader):,}/epoch")
+info(f"  Epochs   : {EPOCHS}  |  Batch: {BATCH_SIZE}  |  Block: {BLOCK_SIZE}")
+info(f"  LR       : {LR_MAX:.2e} -> {LR_MIN:.2e} ({sched_type})")
+info(f"  Accum    : {GRAD_ACCUM_STEPS} steps")
+info(f"  Val split: {VAL_SPLIT:.0%}")
+info(f"  Log file : training.log")
+info(f"  Progress : {PROGRESS_LOG}")
+info(f"  CSV log  : {LOSS_RESP_LOG}")
+info("")
+
+# =========================================================
+# Utilities
+# =========================================================
 
 def cleanup():
-    torch.cuda.empty_cache()
+    if IS_CUDA:
+        torch.cuda.empty_cache()
     gc.collect()
 
-def sync_filesystem():
-    os.system('sync')  # Force write buffers to disk
+_shutting_down = False
 
-def get_memory_usage():
-    process = psutil.Process(os.getpid())
-    return process.memory_percent()
-
-# Graceful shutdown handler
 def signal_handler(signum, frame):
-    print("\nReceived shutdown signal. Cleaning up...")
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    print("\nStopping...")
     cleanup()
-    sync_filesystem()
     sys.exit(0)
 
-signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGINT,  signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def calculate_penalties(logits, targets, generated_text):
-    # Similarity penalty
-    probs = F.softmax(logits, dim=-1)
-    max_prob_penalty = torch.max(probs, dim=-1)[0].mean() * SIMILARITY_PENALTY
-    
-    # Diversity calculations
-    unique_tokens = len(torch.unique(targets))
-    total_tokens = targets.numel()
-    diversity_score = unique_tokens / total_tokens
-    diversity_penalty = (1 - diversity_score) * DIVERSITY_FACTOR
-    
-    # Complexity reward
-    complexity_bonus = -COMPLEXITY_REWARD if unique_tokens >= MIN_UNIQUE_TOKENS else 0
-    
-    return max_prob_penalty + diversity_penalty + complexity_bonus
+# =========================================================
+# Profiler mode  (PROFILE=1 python train.py)
+# =========================================================
 
-def analyze_generation_quality(text, tokenizer):
-    """Analyze generated text quality and return a loss adjustment factor."""
-    if not text or len(text) < 5:
-        return 0.5  # Low quality - very short text
-    
-    # Penalize repetitive patterns
-    words = text.split()
-    unique_ratio = len(set(words)) / max(len(words), 1)
-    repetition_penalty = 1.0 - (unique_ratio * 0.3)
-    
-    # Reward coherent length
-    length_bonus = min(len(text) / 200, 1.0) * 0.2
-    
-    # Penalize common placeholder text
-    low_quality_markers = ["in in in", "sss", "ish", "~~~", "..."]
-    marker_penalty = 0.0
-    for marker in low_quality_markers:
-        if marker in text.lower():
-            marker_penalty += 0.3
-    
-    # Reward diversity in character usage
-    unique_chars = len(set(text))
-    diversity_bonus = min(unique_chars / 50, 1.0) * 0.2
-    
-    # === NEW: Check for reward words ===
-    reward_word_bonus = 0.0
-    text_lower = text.lower()
-    for word in REWARD_WORDS:
-        if word in text_lower:
-            reward_word_bonus += WORD_REWARD_BONUS
-    
-    # === NEW: Check for penalize words ===
-    penalize_word_penalty = 0.0
-    for word in PENALIZE_WORDS:
-        if word in text_lower:
-            penalize_word_penalty += WORD_PENALTY_BONUS
-    
-    quality_score = (
-        repetition_penalty + 
-        length_bonus + 
-        diversity_bonus - 
-        marker_penalty +
-        reward_word_bonus -
-        penalize_word_penalty
-    )
-    
-    return max(0.1, min(quality_score, 1.5))  # Clamp between 0.1 and 1.5
+if os.environ.get("PROFILE", "0") == "1":
+    from torch.profiler import profile, ProfilerActivity
+    info("[PROFILER] Running 20 steps...")
+    with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+        for step, (x, y) in enumerate(dataloader):
+            if step >= 20:
+                break
+            with autocast():
+                _, loss = model(x, y)
+            # FIX: use properly scaled loss in profiler so backward time is realistic
+            loss = loss / GRAD_ACCUM_STEPS
+            if USE_SCALER:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+    table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=15)
+    print(table)
+    detail(table)
+    sys.exit(0)
+
+# =========================================================
+# Training Loop
+# =========================================================
+
+start_time    = time.time()
+# FIX: start from resumed_batches so elapsed-time calculations survive resume
+batches_done  = resumed_batches
+total_batches = EPOCHS * len(dataloader)
+
+def save_best():
+    pass  # used as a namespace to carry best_val across epochs
 
 for epoch in range(start_epoch, EPOCHS):
-    # Wait for lock to be released before starting each epoch
-    train_lock.acquire()
-    train_lock.release()
     model.train()
-    loop = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
-    total_loss = 0
+    loop = tqdm(
+        dataloader,
+        desc  = f"Epoch {epoch + 1}/{EPOCHS}",
+        ncols = None,
+        leave = True,
+        total = len(dataloader),
+    )
 
-    for x, y in loop:
-        # Check memory usage and cleanup if needed
-        if get_memory_usage() > 90:  # If using >90% of system memory
-            print("\nHigh memory usage detected. Running cleanup...")
-            cleanup()
-        
-        train_lock.acquire()
-        train_lock.release()
-        x, y = x.to(device), y.to(device)
-        
-        try:
-            logits, base_loss = model(x, y)
-            
-            # Calculate combined penalties
-            penalties = calculate_penalties(logits, y, None)
-            
-            # Final loss with all penalties
-            loss = base_loss + penalties
-            
-            optimizer.zero_grad()
+    total_loss  = 0.0
+    batch_count = 0
+    # FIX: track whether the final accumulation window in the epoch was already stepped,
+    # using a dedicated flag that isn't reset inside the per-step loop.
+    last_accum_stepped = False
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (x, y) in enumerate(loop):
+        with autocast():
+            logits, loss = model(x, y)
+
+        # Detect exploding / vanishing gradients early
+        if torch.isnan(loss) or torch.isinf(loss):
+            error(f"Loss is NaN/Inf at step {step}. Stopping.")
+            sys.exit(1)
+
+        true_loss = loss.item()
+        # Scale loss for gradient accumulation
+        loss = loss / GRAD_ACCUM_STEPS
+
+        if USE_SCALER:
+            scaler.scale(loss).backward()
+        else:
             loss.backward()
-            if GRAD_CLIP is not None:
+
+        # FIX: track whether this step completed an accumulation window
+        if (step + 1) % GRAD_ACCUM_STEPS == 0:
+            if USE_SCALER:
+                scaler.unscale_(optimizer)
+                if GRAD_CLIP:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if GRAD_CLIP:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            last_accum_stepped = True
+        else:
+            last_accum_stepped = False
+
+        total_loss  += true_loss
+        batch_count += 1
+        batches_done += 1
+
+        if batch_count % LOG_EVERY == 0:
+            avg_loss   = total_loss / batch_count
+            elapsed    = time.time() - start_time
+            # FIX: ETA uses batches done this session only (start_time is this session)
+            batches_this_session = batches_done - resumed_batches
+            remaining  = (
+                (total_batches - batches_done) * (elapsed / batches_this_session)
+                if batches_this_session > 0 and elapsed > 0 else 0
+            )
+            tok_per_sec = int(batches_this_session * BATCH_SIZE * BLOCK_SIZE / elapsed) if elapsed > 0 else 0
+            mins, secs  = divmod(remaining, 60)
+            current_lr  = scheduler.get_last_lr()[0]
+            loop.set_postfix(
+                loss = f"{avg_loss:.4f}",
+                lr   = f"{current_lr:.2e}",
+                tok  = f"{tok_per_sec:,}",
+                eta  = f"{int(mins):02d}:{int(secs):02d}",
+            )
+
+        if batch_count % 50 == 0:
+            detail(
+                f"Epoch {epoch+1} step {batch_count} | "
+                f"loss {total_loss/batch_count:.4f} | "
+                f"lr {scheduler.get_last_lr()[0]:.2e}"
+            )
+
+    # FIX: only handle leftover gradients if the final batch did NOT complete
+    # an accumulation window — prevents the double scheduler.step() bug.
+    if not last_accum_stepped:
+        if USE_SCALER:
+            scaler.unscale_(optimizer)
+            if GRAD_CLIP:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            if GRAD_CLIP:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
-            total_loss += loss.item()
-        except RuntimeError as e:
-            print(f"\nError during training: {e}")
-            cleanup()
-            continue
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
 
-        # Periodic cleanup every 10 batches
-        if batches_done % 10 == 0:
-            cleanup()
-            sync_filesystem()  # Sync to prevent filesystem corruption
+    elapsed     = time.time() - start_time
+    avg_loss    = total_loss / batch_count
+    batches_this_session = batches_done - resumed_batches
+    tok_per_sec = int(batches_this_session * BATCH_SIZE * BLOCK_SIZE / elapsed) if elapsed > 0 else 0
+    # FIX: capture LR after all end-of-epoch stepping is done (moved to after leftover block)
+    current_lr  = scheduler.get_last_lr()[0]
 
-        # ACT for all training
-        batches_done += 1
-        elapsed = time.time() - start_time
-        time_per_batch = elapsed / batches_done
-        remaining = (total_batches - batches_done) * time_per_batch
-        mins, secs = divmod(remaining, 60)
-        act_str = f"{int(mins):02d}:{int(secs):02d}"
+    # Evaluate validation loss with model in eval mode, no grad
+    val_loss = evaluate_val_loss(model, dataloader)
 
-        loop.set_postfix(loss=loss.item(), ACT=act_str)
+    info(
+        f"Epoch {epoch + 1:>3}/{EPOCHS} | "
+        f"train {avg_loss:.4f} | val {val_loss:.4f} | "
+        f"lr {current_lr:.2e} | {tok_per_sec:,} tok/s"
+    )
 
-    # After each epoch
-    cleanup()
-    sync_filesystem()
-    # Save after each epoch
-    os.makedirs(f"data/models/epoch{(epoch)+1}", exist_ok=True)
-    torch.save(model.state_dict(), f"data/models/epoch{(epoch)+1}/model.pt")
-    torch.save(model.state_dict(), f"data/models/model.pt")
-    # Save last completed epoch
+    # Save checkpoints
+    epoch_dir = f"data/models/epoch{epoch + 1}"
+    os.makedirs(epoch_dir, exist_ok=True)
+    torch.save(unwrap_model(model).state_dict(), f"{epoch_dir}/model.pt")
+    torch.save(unwrap_model(model).state_dict(), checkpoint_path)
+    torch.save(scheduler.state_dict(), scheduler_path)
     with open(epoch_path, "w") as f:
         f.write(str(epoch + 1))
+    # FIX: persist batches_done so resume can restore accurate progress tracking
+    torch.save({"batches_done": batches_done}, progress_path)
+    detail(f"Checkpoint saved: {epoch_dir}/model.pt")
 
-    with open("epoch_generations.txt", "a") as f:
-        test_prompts = ["hi", "hello", "how are you", "what is", "tell me about"]
+    # Save best-val-loss checkpoint separately so it survives overfitting epochs
+    best_val_path = "data/models/model_best.pt"
+    if not hasattr(save_best, "best_val") or val_loss < save_best.best_val:
+        save_best.best_val = val_loss
+        torch.save(unwrap_model(model).state_dict(), best_val_path)
+        detail(f"New best val loss {val_loss:.4f} — saved to {best_val_path}")
 
-        for prompt in test_prompts:
-            generated = generate_text(prompt="user: " + prompt + "~", model=model, tokenizer=tokenizer, device=device, max_new_tokens=MAX_TRAIN_TOKENS)
-            
-            # === NEW: Detect words in generation ===
-            found_reward = [w for w in REWARD_WORDS if w in generated.lower()]
+    # Terminal generation preview — eval mode + no_grad
+    model.eval()
+    try:
+        with torch.no_grad():
+            preview = generate_response(
+                EVAL_PROMPTS[0], model, tokenizer, device, autocast,
+                max_new_tokens=MAX_GEN_TOKENS, stream=False,
+            )
+        info(f"         sample: {preview[:80].replace(chr(10), ' ')}")
+    except Exception as e:
+        warn(f"Generation failed: {e}")
 
-            f.write(f"Prompt: '{prompt}'\nGeneration: {generated}\n")
-            if found_reward:
-                loss = loss - WORD_REWARD
-            else:
-                loss = loss + WORD_PENALTY
+    # FIX: model is already in eval mode from the preview block above.
+    # write_progress and write_loss_resp expect eval mode and leave model in eval.
+    # We set train mode once at the end instead of ping-ponging inside each function.
+    write_progress(epoch + 1, avg_loss, val_loss, current_lr, tok_per_sec, model)
+    write_loss_resp(epoch + 1, avg_loss, val_loss, current_lr, tok_per_sec, model)
 
-# Final cleanup
-cleanup()
-sync_filesystem()
-print("Training complete.")
-print()
-print("epoch auto test data:")
-with open("epoch_generations.txt", "r") as a:
-    print(a.read())
+    # Return to train mode for next epoch
+    model.train()
+
+    cleanup()
+
+info("")
+info("Training complete.")
 input("Press Enter to exit...")

@@ -1,31 +1,34 @@
 import os
 import sys
-# Add imports for tuning
 import torch
 import torch.nn.functional as F
 from model import GPT, GPTConfig
 from tokenizer import get_tokenizer
 from config import *
-# Try to import run_tune from tune.py; if not available, provide a fallback that runs the script.
+
 try:
      from tune import run_tune as _run_tune_module
 except Exception:
      _run_tune_module = None
 
 def run_tune():
- os.system("python3 tune.py")
+    os.system("clear")
+    os.system("python3 tune.py")
 
 def run_generate():
-    os.system("python3 generate.py")
+    os.system("clear")
+    os.system("python3 chat.py")
 
 def run_train():
+    os.system("clear")
     os.system("python3 train.py")
 
 def run_config_edit():
     os.system("nano config.py")
 
 def clean():
-    os.system("sudo rm -r data/models")
+    os.system("clear")
+    os.system("rm -r data/models training.log loss-resp.log progress.log tokenizer.model tokenizer.vocab data/training_data/_prebatched* data/training_data/_tokens.pt")
 
 def main():
     os.system("clear")
